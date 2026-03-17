@@ -311,22 +311,180 @@ class AssetWatcherManager:
         """Handle ftrack.update events."""
         try:
             entities = event.get('data', {}).get('entities', [])
-            
+
             logger.info(f"[AssetWatcher] ftrack.update received: {len(entities)} entities")
 
             for entity in entities:
                 entity_type = (entity.get('entityType') or '').lower()
                 action = (entity.get('action') or '').lower()
-                
-                logger.debug(f"[AssetWatcher] Entity: type={entity_type}, action={action}, id={entity.get('entityId')}")
+                changes = entity.get('changes', {})
+
+                logger.info(f"[AssetWatcher] Entity: type={entity_type}, action={action}, id={entity.get('entityId')}, changes={list(changes.keys())}")
 
                 # New AssetVersion created (some installations report action=add)
                 if entity_type == 'assetversion' and action in ('create', 'add'):
                     logger.info(f"[AssetWatcher] ✓ AssetVersion event ({action}): {entity.get('entityId')}")
                     self._handle_new_version(entity)
-                
+
+                # AssetVersion status changed
+                elif entity_type == 'assetversion' and action == 'update':
+                    if 'statusid' in changes:
+                        logger.info(f"[AssetWatcher] ✓ AssetVersion status change: {entity.get('entityId')}")
+                        self._handle_status_change(entity)
+
+                # Asset status changed
+                elif entity_type == 'asset' and action == 'update':
+                    if 'statusid' in changes:
+                        logger.info(f"[AssetWatcher] ✓ Asset status change: {entity.get('entityId')}")
+                        self._handle_status_change(entity)
+
         except Exception as e:
             logger.error(f"[AssetWatcher] Error handling ftrack.update: {e}", exc_info=True)
+
+    def _handle_status_change(self, entity: Dict[str, Any]):
+        """Handle AssetVersion/Asset status change."""
+        _TARGET_STATUS = 'Use This'
+        _USE_THIS_KEY = 'use_this_list'
+        # Keys in asset.metadata that are not component entries
+        _NON_COMPONENT_KEYS = {_USE_THIS_KEY, 'status_note'}
+
+        version_id = entity.get('entityId')
+        changes = entity.get('changes', {})
+        new_status_id = (changes.get('statusid') or {}).get('new')
+        old_status_id = (changes.get('statusid') or {}).get('old')
+
+        logger.info(f"[AssetWatcher] _handle_status_change: version_id={version_id}, {old_status_id} -> {new_status_id}")
+
+        try:
+            entity_type = (entity.get('entityType') or '').lower()
+
+            if entity_type == 'assetversion':
+                version = self._session.query(
+                    f'select id, version, status.name, asset_id, asset.name, asset.metadata, '
+                    f'components.id, components.name, components.file_type '
+                    f'from AssetVersion where id is "{version_id}"'
+                ).first()
+                if not version:
+                    logger.warning(f"[AssetWatcher] AssetVersion {version_id} not found")
+                    return
+                asset = version['asset']
+                asset_name = asset['name']
+                new_status_name = version['status']['name'] if version.get('status') else 'Unknown'
+            else:
+                # entity_type == 'asset'
+                asset = self._session.query(
+                    f'select id, name, status.name, metadata '
+                    f'from Asset where id is "{version_id}"'
+                ).first()
+                if not asset:
+                    logger.warning(f"[AssetWatcher] Asset {version_id} not found")
+                    return
+                asset_name = asset['name']
+                new_status_name = asset['status']['name'] if asset.get('status') else 'Unknown'
+
+            logger.info(f"[AssetWatcher] Status change: '{asset_name}' -> '{new_status_name}'")
+
+            self._notify_update('asset_status_changed', {
+                'entity_id': version_id,
+                'entity_type': entity_type,
+                'asset_name': asset_name,
+                'new_status_id': new_status_id,
+                'old_status_id': old_status_id,
+                'new_status_name': new_status_name,
+            })
+
+            if new_status_name != _TARGET_STATUS:
+                return
+
+            # --- Build / update use_this_list ---
+            asset_meta = dict(asset.get('metadata') or {})
+
+            # Parse existing use_this_list (or start fresh)
+            try:
+                use_this = json.loads(asset_meta.get(_USE_THIS_KEY) or '{}')
+            except Exception:
+                use_this = {}
+
+            # Clean up any status_note that leaked into use_this_list from a previous run
+            use_this.pop('status_note', None)
+
+            # Build component dict from the specific version that was set to "Use This"
+            # (NOT from asset.metadata which reflects the latest published version)
+            current_components = {}
+            if entity_type == 'assetversion':
+                for comp in (version.get('components') or []):
+                    comp_name = comp.get('name', '') or ''
+                    raw_ext = comp.get('file_type', '') or ''
+                    ext = str(raw_ext).lstrip('.')
+                    key = f"{comp_name}.{ext}" if (comp_name and ext) else comp_name or ''
+                    if key:
+                        current_components[key] = comp['id']
+
+            if not current_components:
+                logger.info(f"[AssetWatcher] No components found on version for '{asset_name}', nothing to merge")
+                return
+
+            # Merge: update components that are present now, keep ones that are absent
+            updated = []
+            added = []
+            for comp_key, comp_id in current_components.items():
+                if comp_key in use_this:
+                    if use_this[comp_key] != comp_id:
+                        use_this[comp_key] = comp_id
+                        updated.append(comp_key)
+                else:
+                    use_this[comp_key] = comp_id
+                    added.append(comp_key)
+
+            kept = [k for k in use_this if k not in current_components]
+            logger.info(
+                f"[AssetWatcher] use_this_list for '{asset_name}': "
+                f"added={added}, updated={updated}, kept={kept}"
+            )
+
+            # Always remove status_note regardless of whether use_this_list changed
+            had_status_note = 'status_note' in asset_meta
+            asset_meta.pop('status_note', None)
+
+            if not added and not updated and not had_status_note:
+                logger.info(f"[AssetWatcher] Nothing to update for '{asset_name}', skipping commit")
+                return
+
+            asset_meta[_USE_THIS_KEY] = json.dumps(use_this)
+            asset['metadata'] = asset_meta
+            self._session.commit()
+            logger.info(f"[AssetWatcher] ✓ use_this_list written to asset '{asset_name}' (id={asset['id']}): {use_this}")
+
+            # --- Reset all other versions of this asset to "Published" ---
+            if entity_type == 'assetversion':
+                asset_id = version['asset_id']
+                published_status = self._session.query(
+                    'Status where name is "Published"'
+                ).first()
+
+                if not published_status:
+                    logger.warning(f"[AssetWatcher] 'Published' status not found, cannot reset other versions")
+                else:
+                    other_versions = self._session.query(
+                        f'select id, version, status.name '
+                        f'from AssetVersion where asset_id is "{asset_id}" and id is_not "{version_id}"'
+                    ).all()
+
+                    to_reset = [v for v in other_versions if v['status']['name'] != 'Published']
+                    for v in to_reset:
+                        v['status'] = published_status
+
+                    if to_reset:
+                        self._session.commit()
+                        logger.info(
+                            f"[AssetWatcher] ✓ Reset {len(to_reset)} other version(s) of '{asset_name}' to 'Published': "
+                            f"{[v['version'] for v in to_reset]}"
+                        )
+                    else:
+                        logger.info(f"[AssetWatcher] All other versions of '{asset_name}' already 'Published'")
+
+        except Exception as e:
+            logger.error(f"[AssetWatcher] Error handling status change: {e}", exc_info=True)
 
     def _poll_loop(self):
         """Periodic polling loop as a fallback to event-based updates."""

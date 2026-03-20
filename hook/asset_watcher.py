@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import socket
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -227,6 +228,43 @@ class AssetWatcherManager:
                 callback(event_type, data)
             except Exception as e:
                 logger.warning(f"Callback error: {e}")
+
+    def _publish_use_this_changed(
+        self,
+        asset_id: str,
+        asset_version_id: Optional[str],
+        use_this_list: Dict[str, str],
+        scenario_name: str = "local_sync_out_symlink",
+        target_location_id: Optional[str] = None,
+    ) -> None:
+        """Publish event that starts local scenario scheduler pipeline."""
+        if not asset_id or not use_this_list:
+            return
+        run_id = str(uuid.uuid4())
+        current_hostname = socket.gethostname().lower()
+        payload = {
+            "run_id": run_id,
+            "scenario_name": scenario_name,
+            "asset_id": str(asset_id),
+            "asset_version_id": str(asset_version_id) if asset_version_id else None,
+            "use_this_list": use_this_list,
+            "target_location_id": target_location_id,
+            "created_at": datetime.now().isoformat(),
+        }
+        self._session.event_hub.publish(
+            ftrack_api.event.base.Event(
+                topic="mroya.asset.use-this.changed",
+                data=payload,
+                source={"hostname": current_hostname},
+            ),
+            on_error="ignore",
+        )
+        logger.info(
+            "[AssetWatcher] Published mroya.asset.use-this.changed run_id=%s asset_id=%s components=%d",
+            run_id[:8],
+            str(asset_id)[:8],
+            len(use_this_list),
+        )
     
     def register(self):
         """Register event listeners and start watching."""
@@ -323,26 +361,37 @@ class AssetWatcherManager:
 
                 # New AssetVersion created (some installations report action=add)
                 if entity_type == 'assetversion' and action in ('create', 'add'):
-                    logger.info(f"[AssetWatcher] ✓ AssetVersion event ({action}): {entity.get('entityId')}")
+                    logger.info(f"[AssetWatcher] AssetVersion event ({action}): {entity.get('entityId')}")
                     self._handle_new_version(entity)
 
-                # AssetVersion status changed
+                # AssetVersion status changed (use_this_list / custom event / bulk Published reset: web hook only)
                 elif entity_type == 'assetversion' and action == 'update':
                     if 'statusid' in changes:
-                        logger.info(f"[AssetWatcher] ✓ AssetVersion status change: {entity.get('entityId')}")
+                        logger.info(
+                            "[AssetWatcher] AssetVersion status change: %s",
+                            entity.get('entityId'),
+                        )
                         self._handle_status_change(entity)
 
-                # Asset status changed
+                # Asset status changed (same as assetversion branch)
                 elif entity_type == 'asset' and action == 'update':
                     if 'statusid' in changes:
-                        logger.info(f"[AssetWatcher] ✓ Asset status change: {entity.get('entityId')}")
+                        logger.info(
+                            "[AssetWatcher] Asset status change: %s",
+                            entity.get('entityId'),
+                        )
                         self._handle_status_change(entity)
 
         except Exception as e:
             logger.error(f"[AssetWatcher] Error handling ftrack.update: {e}", exc_info=True)
 
     def _handle_status_change(self, entity: Dict[str, Any]):
-        """Handle AssetVersion/Asset status change."""
+        """Notify UI on Asset/AssetVersion status change.
+
+        Writing ``use_this_list``, publishing ``mroya.asset.use-this.changed``, and resetting
+        other versions to Published is disabled in Connect; a server web hook owns that flow
+        to avoid duplicate commits when multiple clients receive the same update.
+        """
         _TARGET_STATUS = 'Use This'
         _USE_THIS_KEY = 'use_this_list'
         # Keys in asset.metadata that are not component entries
@@ -393,95 +442,115 @@ class AssetWatcherManager:
                 'new_status_name': new_status_name,
             })
 
-            if new_status_name != _TARGET_STATUS:
-                return
+            # Legacy Connect path (disabled): keep indented under ``if False`` for easy rollback only.
+            if False:
+                if new_status_name != _TARGET_STATUS:
+                    return
 
-            # --- Build / update use_this_list ---
-            asset_meta = dict(asset.get('metadata') or {})
+                # --- Build / update use_this_list ---
+                asset_meta = dict(asset.get('metadata') or {})
 
-            # Parse existing use_this_list (or start fresh)
-            try:
-                use_this = json.loads(asset_meta.get(_USE_THIS_KEY) or '{}')
-            except Exception:
-                use_this = {}
+                # Parse existing use_this_list (or start fresh)
+                try:
+                    use_this = json.loads(asset_meta.get(_USE_THIS_KEY) or '{}')
+                except Exception:
+                    use_this = {}
 
-            # Clean up any status_note that leaked into use_this_list from a previous run
-            use_this.pop('status_note', None)
+                # Clean up any status_note that leaked into use_this_list from a previous run
+                use_this.pop('status_note', None)
 
-            # Build component dict from the specific version that was set to "Use This"
-            # (NOT from asset.metadata which reflects the latest published version)
-            current_components = {}
-            if entity_type == 'assetversion':
-                for comp in (version.get('components') or []):
-                    comp_name = comp.get('name', '') or ''
-                    raw_ext = comp.get('file_type', '') or ''
-                    ext = str(raw_ext).lstrip('.')
-                    key = f"{comp_name}.{ext}" if (comp_name and ext) else comp_name or ''
-                    if key:
-                        current_components[key] = comp['id']
+                # Build component dict from the specific version that was set to "Use This"
+                # (NOT from asset.metadata which reflects the latest published version)
+                current_components = {}
+                if entity_type == 'assetversion':
+                    for comp in (version.get('components') or []):
+                        comp_name = comp.get('name', '') or ''
+                        raw_ext = comp.get('file_type', '') or ''
+                        ext = str(raw_ext).lstrip('.')
+                        key = f"{comp_name}.{ext}" if (comp_name and ext) else comp_name or ''
+                        if key:
+                            current_components[key] = comp['id']
 
-            if not current_components:
-                logger.info(f"[AssetWatcher] No components found on version for '{asset_name}', nothing to merge")
-                return
+                if not current_components:
+                    logger.info(
+                        f"[AssetWatcher] No components found on version for '{asset_name}', nothing to merge"
+                    )
+                    return
 
-            # Merge: update components that are present now, keep ones that are absent
-            updated = []
-            added = []
-            for comp_key, comp_id in current_components.items():
-                if comp_key in use_this:
-                    if use_this[comp_key] != comp_id:
+                # Merge: update components that are present now, keep ones that are absent
+                updated = []
+                added = []
+                for comp_key, comp_id in current_components.items():
+                    if comp_key in use_this:
+                        if use_this[comp_key] != comp_id:
+                            use_this[comp_key] = comp_id
+                            updated.append(comp_key)
+                    else:
                         use_this[comp_key] = comp_id
-                        updated.append(comp_key)
-                else:
-                    use_this[comp_key] = comp_id
-                    added.append(comp_key)
+                        added.append(comp_key)
 
-            kept = [k for k in use_this if k not in current_components]
-            logger.info(
-                f"[AssetWatcher] use_this_list for '{asset_name}': "
-                f"added={added}, updated={updated}, kept={kept}"
-            )
+                kept = [k for k in use_this if k not in current_components]
+                logger.info(
+                    f"[AssetWatcher] use_this_list for '{asset_name}': "
+                    f"added={added}, updated={updated}, kept={kept}"
+                )
 
-            # Always remove status_note regardless of whether use_this_list changed
-            had_status_note = 'status_note' in asset_meta
-            asset_meta.pop('status_note', None)
+                # Always remove status_note regardless of whether use_this_list changed
+                had_status_note = 'status_note' in asset_meta
+                asset_meta.pop('status_note', None)
 
-            if not added and not updated and not had_status_note:
-                logger.info(f"[AssetWatcher] Nothing to update for '{asset_name}', skipping commit")
-                return
+                if not added and not updated and not had_status_note:
+                    logger.info(
+                        f"[AssetWatcher] Nothing to update for '{asset_name}', skipping commit"
+                    )
+                    return
 
-            asset_meta[_USE_THIS_KEY] = json.dumps(use_this)
-            asset['metadata'] = asset_meta
-            self._session.commit()
-            logger.info(f"[AssetWatcher] ✓ use_this_list written to asset '{asset_name}' (id={asset['id']}): {use_this}")
+                asset_meta[_USE_THIS_KEY] = json.dumps(use_this)
+                asset['metadata'] = asset_meta
+                self._session.commit()
+                logger.info(
+                    f"[AssetWatcher] use_this_list written to asset '{asset_name}' "
+                    f"(id={asset['id']}): {use_this}"
+                )
+                self._publish_use_this_changed(
+                    asset_id=str(asset["id"]),
+                    asset_version_id=str(version_id) if version_id else None,
+                    use_this_list={str(k): str(v) for k, v in use_this.items()},
+                    scenario_name="local_sync_out_symlink",
+                    target_location_id=None,
+                )
 
-            # --- Reset all other versions of this asset to "Published" ---
-            if entity_type == 'assetversion':
-                asset_id = version['asset_id']
-                published_status = self._session.query(
-                    'Status where name is "Published"'
-                ).first()
+                # --- Reset all other versions of this asset to "Published" ---
+                if entity_type == 'assetversion':
+                    asset_id = version['asset_id']
+                    published_status = self._session.query(
+                        'Status where name is "Published"'
+                    ).first()
 
-                if not published_status:
-                    logger.warning(f"[AssetWatcher] 'Published' status not found, cannot reset other versions")
-                else:
-                    other_versions = self._session.query(
-                        f'select id, version, status.name '
-                        f'from AssetVersion where asset_id is "{asset_id}" and id is_not "{version_id}"'
-                    ).all()
-
-                    to_reset = [v for v in other_versions if v['status']['name'] != 'Published']
-                    for v in to_reset:
-                        v['status'] = published_status
-
-                    if to_reset:
-                        self._session.commit()
-                        logger.info(
-                            f"[AssetWatcher] ✓ Reset {len(to_reset)} other version(s) of '{asset_name}' to 'Published': "
-                            f"{[v['version'] for v in to_reset]}"
+                    if not published_status:
+                        logger.warning(
+                            "[AssetWatcher] 'Published' status not found, cannot reset other versions"
                         )
                     else:
-                        logger.info(f"[AssetWatcher] All other versions of '{asset_name}' already 'Published'")
+                        other_versions = self._session.query(
+                            f'select id, version, status.name '
+                            f'from AssetVersion where asset_id is "{asset_id}" and id is_not "{version_id}"'
+                        ).all()
+
+                        to_reset = [v for v in other_versions if v['status']['name'] != 'Published']
+                        for v in to_reset:
+                            v['status'] = published_status
+
+                        if to_reset:
+                            self._session.commit()
+                            logger.info(
+                                f"[AssetWatcher] Reset {len(to_reset)} other version(s) of "
+                                f"'{asset_name}' to 'Published': {[v['version'] for v in to_reset]}"
+                            )
+                        else:
+                            logger.info(
+                                f"[AssetWatcher] All other versions of '{asset_name}' already 'Published'"
+                            )
 
         except Exception as e:
             logger.error(f"[AssetWatcher] Error handling status change: {e}", exc_info=True)
@@ -928,6 +997,11 @@ class AssetWatcherManager:
                 ftrack_api.event.base.Event(
                     topic='mroya.transfer.request',
                     data={
+                        'job_id': None,
+                        'user_id': None,
+                        'from_location_id': source_location_id,
+                        'to_location_id': target_location,
+                        'selection': [{'entityType': 'Component', 'entityId': component['id']}],
                         'component_ids': [component['id']],
                         'source_location_id': source_location_id,
                         'target_location_id': target_location,
@@ -998,6 +1072,11 @@ class AssetWatcherManager:
                 ftrack_api.event.base.Event(
                     topic='mroya.transfer.request',
                     data={
+                        'job_id': None,
+                        'user_id': None,
+                        'from_location_id': None,
+                        'to_location_id': target_location,
+                        'selection': [{'entityType': 'Component', 'entityId': component_id}],
                         'component_ids': [component_id],
                         'source_location_id': None,
                         'target_location_id': target_location,
